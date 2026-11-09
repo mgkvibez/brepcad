@@ -14,6 +14,17 @@ enclose, which side is material.
 Those answers must be **analytic**. A kernel that approximates a circle with line segments produces fillets that are subtly
 wrong and exports that cannot be machined. So arcs stay arcs, and intersections are solved in closed form.
 
+## Constraints
+
+`solveLines` moves a sketch the least amount that satisfies its constraints, which is the linear-algebra question every
+sketch tool really asks: minimise displacement subject to `A u = b`, solved here by substituting out the constraints and
+solving `A Aᵀ λ = b - A u0` over exact BigInt fractions, converting back once at the end.
+
+Supported today: `horizontal`, `vertical`, `coincident`, `fixed`. Each is linear in the coordinates, so each is exact.
+Parallel, perpendicular and tangency are **not** supported, and are refused by name rather than linearised, because a
+linearised approximation is precisely the silent inaccuracy this project exists to avoid. Contradictory constraints are
+refused by name instead of divided through.
+
 ## Status
 
 **Stage 0: scaffolding.** Exact 2D sketch geometry with tests: line/line and line/arc intersection, arc sweep handling
@@ -21,7 +32,7 @@ including full turns, signed area by the shoelace rule with exact circular segme
 the axis crossings an arc sweeps through. There is no constraint solver, no extruder, no B-rep topology and no kernel
 integration yet.
 
-**Tests:** 11
+**Tests:** 21
 
 ```bash
 npm ci && npm run verify
