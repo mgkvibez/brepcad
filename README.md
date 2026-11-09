@@ -21,6 +21,8 @@ including full turns, signed area by the shoelace rule with exact circular segme
 the axis crossings an arc sweeps through. There is no constraint solver, no extruder, no B-rep topology and no kernel
 integration yet.
 
+**Tests:** 11
+
 ```bash
 npm ci && npm run verify
 ```
