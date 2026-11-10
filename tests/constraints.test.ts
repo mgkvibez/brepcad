@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ConstraintError, solveLines, type LineEntity } from "../src/constraints.js";
+import { ConstraintError, solveLines, solveSketch, type LineEntity } from "../src/constraints.js";
 
 const line = (id: string, x1: number, y1: number, x2: number, y2: number): LineEntity => ({
   kind: "line",
@@ -103,5 +103,137 @@ describe("constraint solving", () => {
     );
     expect(solved[0]!.end.x).toBe(solved[1]!.start.x);
     expect(solved[0]!.end.y).toBe(solved[1]!.start.y);
+  });
+});
+
+describe("angular constraints", () => {
+  it("refuses to solve an angular constraint as if it were linear, and says where to go instead", () => {
+    const lines = [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 9)];
+    expect(() => solveLines(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }])).toThrow(/parallel\(a, b\) is angular/);
+    expect(() => solveLines(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }])).toThrow(/solveSketch/);
+    expect(() => solveLines(lines, [{ kind: "perpendicular", lineA: "a", lineB: "b" }])).toThrow(
+      /perpendicular\(a, b\) is angular/,
+    );
+  });
+
+  it("brings a line parallel to a horizontal reference, and reports the error rather than claiming exactness", () => {
+    const report = solveSketch(
+      [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 9)],
+      [
+        { kind: "horizontal", line: "a" },
+        { kind: "parallel", lineA: "a", lineB: "b" },
+      ],
+    );
+    const [a, b] = report.lines;
+    expect(b!.end.y).toBeCloseTo(b!.start.y, 12);
+    expect(report.angularResidual).toBeLessThanOrEqual(1e-12);
+    expect(report.iterations).toBeGreaterThanOrEqual(1);
+    // Newton closes on the root without landing on it in exact arithmetic, and the report must not pretend otherwise
+    expect(report.exact).toBe(false);
+    expect(a!.start.y).toBe(0);
+    expect(a!.end.y).toBe(0);
+  });
+
+  it("brings a line perpendicular to a horizontal reference, which is what a square corner is", () => {
+    const report = solveSketch(
+      [line("a", 0, 0, 10, 0), line("b", 2, 3, 5, 9)],
+      [
+        { kind: "horizontal", line: "a" },
+        { kind: "perpendicular", lineA: "a", lineB: "b" },
+      ],
+    );
+    const [, b] = report.lines;
+    expect(b!.end.x).toBeCloseTo(b!.start.x, 12);
+    expect(report.angularResidual).toBeLessThanOrEqual(1e-12);
+  });
+
+  it("rotates lines about their own midpoints instead of sliding them to satisfy an angle", () => {
+    const report = solveSketch([line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 9)], [
+      { kind: "parallel", lineA: "a", lineB: "b" },
+    ]);
+    for (const [index, original] of [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 9)].entries()) {
+      const solved = report.lines[index]!;
+      expect((solved.start.x + solved.end.x) / 2).toBeCloseTo((original.start.x + original.end.x) / 2, 12);
+      expect((solved.start.y + solved.end.y) / 2).toBeCloseTo((original.start.y + original.end.y) / 2, 12);
+    }
+  });
+
+  it("refuses a constraint that names the same line twice", () => {
+    expect(() => solveSketch([line("a", 0, 0, 10, 0)], [{ kind: "parallel", lineA: "a", lineB: "a" }])).toThrow(
+      /constrains a line against itself/,
+    );
+  });
+
+  it("refuses a line with no direction, since an angle to it is undefined", () => {
+    expect(() =>
+      solveSketch([line("a", 0, 0, 10, 0), line("b", 3, 3, 3, 3)], [{ kind: "parallel", lineA: "a", lineB: "b" }]),
+    ).toThrow(/needs a direction.*zero length/);
+  });
+
+  it("refuses parallel and perpendicular on the same pair instead of running until the numbers are astronomical", () => {
+    // the only configuration satisfying both is a collapsed line, so the iterate diverges; this used to hang
+    expect(() =>
+      solveSketch(
+        [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 5)],
+        [
+          { kind: "parallel", lineA: "a", lineB: "b" },
+          { kind: "perpendicular", lineA: "a", lineB: "b" },
+        ],
+      ),
+    ).toThrow(/cannot all be satisfied/);
+  });
+
+  it("refuses to call an unconverged sketch solved when it runs out of iterations", () => {
+    expect(() =>
+      solveSketch([line("a", 0, 0, 10, 0), line("b", 2, 3, 5, 9)], [{ kind: "perpendicular", lineA: "a", lineB: "b" }], {
+        maxIterations: 1,
+        tolerance: 0,
+      }),
+    ).toThrow(/did not converge in 1 iterations/);
+  });
+
+  it("gives exactly what solveLines gives when there is no angle to satisfy", () => {
+    const lines = [line("a", 0, 0, 10, 4), line("b", 10, 4, 20, 4)];
+    const constraints = [
+      { kind: "coincident" as const, lineA: "a", endA: "end" as const, lineB: "b", endB: "start" as const },
+      { kind: "horizontal" as const, line: "b" },
+    ];
+    const report = solveSketch(lines, constraints);
+    expect(report.lines).toEqual(solveLines(lines, constraints));
+    expect(report.exact).toBe(true);
+    expect(report.angularResidual).toBe(0);
+  });
+
+  it("leaves an already-satisfied angular sketch untouched and says it is exact", () => {
+    const lines = [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 5)];
+    const report = solveSketch(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }]);
+    expect(report.exact).toBe(true);
+    expect(report.angularResidual).toBe(0);
+    expect(report.lines).toEqual(lines);
+  });
+});
+
+describe("coordinate representation", () => {
+  it("solves coordinates past 1e21, where formatting a double as text switches to exponent notation", () => {
+    const big = 1e200;
+    const solved = solveLines(
+      [line("a", big, big, 2 * big, 2 * big), line("b", 3 * big, 2 * big, 4 * big, 4 * big)],
+      [{ kind: "coincident", lineA: "a", endA: "end", lineB: "b", endB: "start" }],
+    );
+    expect(solved[0]!.end.x).toBe(solved[1]!.start.x);
+    expect(solved[0]!.end.y).toBe(solved[1]!.start.y);
+    expect(Number.isFinite(solved[0]!.end.x)).toBe(true);
+  });
+
+  it("keeps a coordinate smaller than 1e-20 instead of rounding it to the origin", () => {
+    const tiny = 1e-30;
+    const solved = solveLines(
+      [line("a", 0, 0, tiny, tiny), line("b", 3 * tiny, tiny, 4 * tiny, 4 * tiny)],
+      [{ kind: "coincident", lineA: "a", endA: "end", lineB: "b", endB: "start" }],
+    );
+    const shared = solved[0]!.end;
+    expect(shared.x).toBeGreaterThan(0);
+    expect(Math.abs(shared.x - 2 * tiny) / (2 * tiny)).toBeLessThan(1e-12);
+    expect(solved[1]!.start.x).toBe(shared.x);
   });
 });
