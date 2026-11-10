@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ConstraintError, solveLines, solveSketch, type LineEntity } from "../src/constraints.js";
+import { ConstraintError, solveLines, solveSketch, type Constraint, type LineEntity } from "../src/constraints.js";
 
 const line = (id: string, x1: number, y1: number, x2: number, y2: number): LineEntity => ({
   kind: "line",
@@ -109,14 +109,14 @@ describe("constraint solving", () => {
 describe("angular constraints", () => {
   it("refuses to solve an angular constraint as if it were linear, and says where to go instead", () => {
     const lines = [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 9)];
-    expect(() => solveLines(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }])).toThrow(/parallel\(a, b\) is angular/);
+    expect(() => solveLines(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }])).toThrow(/parallel\(a, b\) is quadratic/);
     expect(() => solveLines(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }])).toThrow(/solveSketch/);
     expect(() => solveLines(lines, [{ kind: "perpendicular", lineA: "a", lineB: "b" }])).toThrow(
-      /perpendicular\(a, b\) is angular/,
+      /perpendicular\(a, b\) is quadratic/,
     );
   });
 
-  it("brings a line parallel to a horizontal reference, and reports the error rather than claiming exactness", () => {
+  it("brings a line parallel to a horizontal reference, and lands on it exactly", () => {
     const report = solveSketch(
       [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 9)],
       [
@@ -126,25 +126,16 @@ describe("angular constraints", () => {
     );
     const [a, b] = report.lines;
     expect(b!.end.y).toBeCloseTo(b!.start.y, 12);
-    expect(report.angularResidual).toBeLessThanOrEqual(1e-12);
-    expect(report.iterations).toBeGreaterThanOrEqual(1);
-    // Newton closes on the root without landing on it in exact arithmetic, and the report must not pretend otherwise
-    expect(report.exact).toBe(false);
+    expect(b!.start.y).toBe(7);
     expect(a!.start.y).toBe(0);
-    expect(a!.end.y).toBe(0);
-  });
-
-  it("brings a line perpendicular to a horizontal reference, which is what a square corner is", () => {
-    const report = solveSketch(
-      [line("a", 0, 0, 10, 0), line("b", 2, 3, 5, 9)],
-      [
-        { kind: "horizontal", line: "a" },
-        { kind: "perpendicular", lineA: "a", lineB: "b" },
-      ],
-    );
-    const [, b] = report.lines;
-    expect(b!.end.x).toBeCloseTo(b!.start.x, 12);
-    expect(report.angularResidual).toBeLessThanOrEqual(1e-12);
+    expect(report.residual).toBe(0);
+    expect(report.exact).toBe(true);
+    // and an angle the same solver cannot express in rationals does not get to claim the same thing
+    const degrees = solveSketch([line("a", 0, 0, 10, 0), line("b", 0, 0, 10, 6)], [
+      { kind: "horizontal", line: "a" },
+      { kind: "angle", lineA: "b", lineB: "a", degrees: 45 },
+    ]);
+    expect(degrees.exact).toBe(false);
   });
 
   it("rotates lines about their own midpoints instead of sliding them to satisfy an angle", () => {
@@ -171,7 +162,7 @@ describe("angular constraints", () => {
   });
 
   it("refuses parallel and perpendicular on the same pair instead of running until the numbers are astronomical", () => {
-    // the only configuration satisfying both is a collapsed line, so the iterate diverges; this used to hang
+    // the only configuration satisfying both is a collapsed line, so the two rows fight and the step goes nowhere
     expect(() =>
       solveSketch(
         [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 5)],
@@ -180,7 +171,7 @@ describe("angular constraints", () => {
           { kind: "perpendicular", lineA: "a", lineB: "b" },
         ],
       ),
-    ).toThrow(/cannot all be satisfied/);
+    ).toThrow(/cannot be satisfied/);
   });
 
   it("refuses to call an unconverged sketch solved when it runs out of iterations", () => {
@@ -201,14 +192,14 @@ describe("angular constraints", () => {
     const report = solveSketch(lines, constraints);
     expect(report.lines).toEqual(solveLines(lines, constraints));
     expect(report.exact).toBe(true);
-    expect(report.angularResidual).toBe(0);
+    expect(report.residual).toBe(0);
   });
 
   it("leaves an already-satisfied angular sketch untouched and says it is exact", () => {
     const lines = [line("a", 0, 0, 10, 0), line("b", 0, 5, 8, 5)];
     const report = solveSketch(lines, [{ kind: "parallel", lineA: "a", lineB: "b" }]);
     expect(report.exact).toBe(true);
-    expect(report.angularResidual).toBe(0);
+    expect(report.residual).toBe(0);
     expect(report.lines).toEqual(lines);
   });
 });
@@ -235,5 +226,143 @@ describe("coordinate representation", () => {
     expect(shared.x).toBeGreaterThan(0);
     expect(Math.abs(shared.x - 2 * tiny) / (2 * tiny)).toBeLessThan(1e-12);
     expect(solved[1]!.start.x).toBe(shared.x);
+  });
+});
+
+describe("distance and angle", () => {
+  const length = (start: { x: number; y: number }, end: { x: number; y: number }) =>
+    Math.hypot(end.x - start.x, end.y - start.y);
+
+  it("sets a line's length by growing both ends about the midpoint, like every sketcher does", () => {
+    const report = solveSketch([line("a", 0, 0, 3, 4)], [
+      { kind: "distance", lineA: "a", endA: "start", lineB: "a", endB: "end", value: 10 },
+    ]);
+    const [solved] = report.lines;
+    // the 3-4-5 triangle scaled to 10, with the midpoint left where it was
+    expect(solved!.start.x).toBeCloseTo(-1.5, 9);
+    expect(solved!.start.y).toBeCloseTo(-2, 9);
+    expect(solved!.end.x).toBeCloseTo(4.5, 9);
+    expect(solved!.end.y).toBeCloseTo(6, 9);
+    expect(length(solved!.start, solved!.end)).toBeCloseTo(10, 9);
+    expect(report.residual).toBeLessThanOrEqual(1e-12);
+  });
+
+  it("lands on a length that is already right without moving anything, and says it is exact", () => {
+    const report = solveSketch([line("a", 0, 0, 3, 4)], [
+      { kind: "distance", lineA: "a", endA: "start", lineB: "a", endB: "end", value: 5 },
+    ]);
+    expect(report.lines[0]).toEqual(line("a", 0, 0, 3, 4));
+    expect(report.exact).toBe(true);
+    expect(report.residual).toBe(0);
+  });
+
+  it("holds two points a dimension apart without dragging a pinned corner", () => {
+    const report = solveSketch(
+      [line("a", 0, 0, 10, 0), line("b", 3, 4, 9, 4)],
+      [
+        { kind: "fixed", line: "a", at: "start", x: 0, y: 0 },
+        { kind: "distance", lineA: "a", endA: "start", lineB: "b", endB: "start", value: 10 },
+      ],
+    );
+    const [a, b] = report.lines;
+    expect(a!.start.x).toBeCloseTo(0, 12);
+    expect(a!.start.y).toBeCloseTo(0, 12);
+    expect(length(a!.start, b!.start)).toBeCloseTo(10, 9);
+    // the correction goes into the free point, along the line it already sat on: 3-4-5 scaled to 10
+    expect(b!.start.x).toBeCloseTo(6, 9);
+    expect(b!.start.y).toBeCloseTo(8, 9);
+  });
+
+  it("sets an angle between two lines, and cannot claim exactness because cos 45° is not rational", () => {
+    const report = solveSketch(
+      [line("a", 0, 0, 10, 0), line("b", 0, 0, 10, 1)],
+      [
+        { kind: "horizontal", line: "a" },
+        { kind: "angle", lineA: "b", lineB: "a", degrees: 45 },
+      ],
+    );
+    const [a, b] = report.lines;
+    expect(a!.end.y).toBeCloseTo(0, 12);
+    const radians = Math.atan2(b!.end.y - b!.start.y, b!.end.x - b!.start.x);
+    expect((Math.abs(radians) * 180) / Math.PI).toBeCloseTo(45, 9);
+    expect(report.residual).toBeLessThanOrEqual(1e-12);
+    // honest: the target is the double nearest cos 45°, which is not a rational the geometry can land on exactly
+    expect(report.exact).toBe(false);
+  });
+
+  it("squares a corner with angle 90 the way perpendicular does, and the two agree", () => {
+    const byAngle = solveSketch([line("a", 0, 0, 10, 0), line("b", 0, 0, 10, 1)], [
+      { kind: "horizontal", line: "a" },
+      { kind: "angle", lineA: "b", lineB: "a", degrees: 90 },
+    ]);
+    const byPerpendicular = solveSketch([line("a", 0, 0, 10, 0), line("b", 0, 0, 10, 1)], [
+      { kind: "horizontal", line: "a" },
+      { kind: "perpendicular", lineA: "b", lineB: "a" },
+    ]);
+    expect(byAngle.lines[1]!.end.x).toBeCloseTo(byPerpendicular.lines[1]!.end.x, 9);
+    expect(byAngle.lines[1]!.end.y).toBeCloseTo(byPerpendicular.lines[1]!.end.y, 9);
+  });
+
+  it("measures the residual in a way that does not change when the sketch is drawn in millimetres", () => {
+    const sketch = (scale: number) => [
+      line("a", 0, 0, 3 * scale, 4 * scale),
+      line("b", 0, 0, 10 * scale, 0),
+    ];
+    const constraints = (scale: number): Constraint[] => [
+      { kind: "distance", lineA: "a", endA: "end", lineB: "b", endB: "end", value: 3 * scale },
+      { kind: "angle", lineA: "a", lineB: "b", degrees: 37 },
+    ];
+    const metric = solveSketch(sketch(1), constraints(1));
+    const millimetres = solveSketch(sketch(1000), constraints(1000));
+    // one tolerance has to mean the same thing at both scales, so the reported error is dimensionless
+    expect(Math.abs(metric.residual - millimetres.residual)).toBeLessThan(1e-6);
+  });
+
+  it("refuses a distance of zero or less, pointing at the constraint that means it", () => {
+    const lines = [line("a", 0, 0, 3, 4)];
+    const at = (value: number) =>
+      () =>
+        solveSketch(lines, [{ kind: "distance", lineA: "a", endA: "start", lineB: "a", endB: "end", value }]);
+    expect(at(0)).toThrow(/positive length/);
+    expect(at(-5)).toThrow(/positive length/);
+  });
+
+  it("refuses a distance between a point and itself", () => {
+    const lines = [line("a", 0, 0, 3, 4)];
+    expect(() =>
+      solveSketch(lines, [{ kind: "distance", lineA: "a", endA: "end", lineB: "a", endB: "end", value: 4 }]),
+    ).toThrow(/point and itself/);
+  });
+
+  it("refuses the angles that already have their own names", () => {
+    const lines = [line("a", 0, 0, 3, 4), line("b", 1, 0, 4, 5)];
+    for (const degrees of [0, 180, -30]) {
+      expect(() => solveSketch(lines, [{ kind: "angle", lineA: "a", lineB: "b", degrees }])).toThrow(
+        /between 0 and 180 degrees/,
+      );
+    }
+  });
+
+  it("refuses an angle between a line and itself", () => {
+    const lines = [line("a", 0, 0, 3, 4)];
+    expect(() => solveSketch(lines, [{ kind: "angle", lineA: "a", lineB: "a", degrees: 30 }])).toThrow(
+      /against itself/,
+    );
+  });
+
+  it("refuses tangent by name and says what it would need", () => {
+    const lines = [line("a", 0, 0, 3, 4), line("b", 1, 0, 4, 5)];
+    expect(() => solveSketch(lines, [{ kind: "tangent", lineA: "a", lineB: "b" }])).toThrow(/tangent is refused by name/);
+    expect(() => solveSketch(lines, [{ kind: "tangent", lineA: "a", lineB: "b" }])).toThrow(/arc's radius/);
+  });
+
+  it("keeps distance and angle out of solveLines, which only claims the linear ones", () => {
+    const lines = [line("a", 0, 0, 3, 4), line("b", 1, 0, 4, 5)];
+    expect(() =>
+      solveLines(lines, [{ kind: "distance", lineA: "a", endA: "start", lineB: "b", endB: "end", value: 2 }]),
+    ).toThrow(/quadratic, not linear/);
+    expect(() => solveLines(lines, [{ kind: "angle", lineA: "a", lineB: "b", degrees: 30 }])).toThrow(
+      /quadratic, not linear/,
+    );
   });
 });

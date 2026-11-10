@@ -21,22 +21,36 @@ sketch tool really asks: minimise displacement subject to `A u = b`, solved here
 solving `A Aᵀ λ = b - A u0` over exact BigInt fractions, converting back once at the end.
 
 `horizontal`, `vertical`, `coincident` and `fixed` are exactly linear in the coordinates, so `solveLines` solves them in
-one step and the answer is exact in rationals. `parallel` and `perpendicular` are quadratic, and `solveLines` refuses
-them by name rather than pretending otherwise.
+one step and the answer is exact in rationals. `parallel`, `perpendicular`, `angle` and `distance` are quadratic, and
+`solveLines` refuses them by name rather than pretending otherwise.
 
-`solveSketch` takes the angular ones: it solves the linear rows exactly, then projects the angular constraints, each
+`solveSketch` takes the quadratic ones: it solves the linear rows exactly, then iterates the quadratic constraints, each
 step linearising them about the current configuration and solving that exactly in rationals. The report says which kind
-of answer came out. `exact` is true only when the equations hold in rationals, not merely within tolerance, and Newton
-on a quadratic closes on the root without ever landing on it: fresh geometry measured between `1e-33` and `1e-14` of
-relative error with `exact: false`, while re-solving geometry that already satisfies the constraints reports
-`exact: true` without moving anything. A caller that needs a square edge reads `angularResidual`; a caller that needs
-proof reads `exact`.
+of answer came out. `exact` is true only when the equations hold in rationals at the geometry returned, not merely
+within tolerance: `parallel` against a horizontal reference lands with both y values at exactly `7`, so `exact: true` and
+`residual: 0`, while an `angle` of 45° cannot be exact because `cos 45°` is irrational, so it reports `exact: false` and a
+residual of `7.8e-13`. A caller that needs a square edge reads `residual`; a caller that needs proof reads `exact`.
 
-Three things are refused by name instead of approximated. An unknown constraint kind, including `tangent`, is rejected
-rather than skipped. So is a set that cannot hold together: `parallel` and `perpendicular` over the same pair have no
-solution except a collapsed line, so the iterate diverges, and a magnitude bound stops it and names the constraints
-instead of running until the rationals are astronomical. And a failure to converge inside the iteration budget is an
-error, not a sketch that looks approximately square.
+`distance` takes two endpoints and a positive length, which is the dimension a sketch is really drawn with: the 3-4-5
+triangle asked for a length of 10 grows symmetrically about its midpoint to `(-1.5, -2)-(4.5, 6)`. `angle` takes a
+target in degrees and picks the side the sketch is already drawn on, so it makes the small correction instead of swinging
+the line round to the mirror answer; swapping the line's endpoints asks for the other side.
+
+Three things the iteration needed, each found by testing rather than by design. An angular equation is homogeneous of
+degree two, so a step along its gradient always shrinks the sketch, and `u = 0` satisfies it exactly: measured on
+`angle = 45°` over a 10-long horizontal and an 11.7-long line at 31°, the residual fell 113 → 27.9 and then both lines
+were half their length and the next steps ran past every bound. The fix is to project each step back onto "this line's
+length does not change", which leaves a rotation about the endpoints' midpoint, and to skip that for a length a
+`distance` constraint already fixes. Separately, an exact rational target such as `cos 45°` has a 53-bit denominator that
+every step multiplies through, so by the third step the coordinates were ~10 in value with numerators past 2^256; each
+step is now re-anchored to the doubles the caller will actually receive, which is what the API returns anyway.
+
+Three things are refused by name instead of approximated. `tangent` is rejected with the reason: tangency is a statement
+about an arc's radius and centre, arcs are not among the solver's unknowns yet, so there is nothing for it to constrain
+and it is not silently skipped. So is a set that cannot hold together: `parallel` and `perpendicular` over the same pair
+have no solution except a collapsed line, the two rows fight, the step stops moving, and the refusal names the
+constraints instead of running until the rationals are astronomical. And a failure to converge inside the iteration
+budget is an error, not a sketch that looks approximately square.
 
 ## Status
 
@@ -45,7 +59,7 @@ arc sweep handling including full turns, signed area by the shoelace rule with e
 boxes that account for the axis crossings an arc sweeps through. On top of it, the constrained-geometry layer described
 above. There is no extruder, no B-rep topology and no kernel integration yet.
 
-**Tests:** 33
+**Tests:** 44
 
 ```bash
 npm ci && npm run verify
@@ -54,9 +68,9 @@ npm ci && npm run verify
 ## Roadmap
 
 1. **Sketch geometry** (done): exact primitives, intersections, area, bounds.
-2. **Constraint solver** (partly done): horizontal, vertical, coincident and fixed solve exactly; parallel and
-   perpendicular iterate with a reported residual. Tangent, distance and angle constraints, and named
-   under-/over-constrained reporting, are still missing.
+2. **Constraint solver** (partly done): horizontal, vertical, coincident and fixed solve exactly; parallel,
+   perpendicular, angle and distance iterate with a reported residual that is exact when it can be. Tangent, arcs as
+   solver unknowns, and named under-/over-constrained reporting are still missing.
 3. **Profiles**: detect closed regions, classify outer boundary against holes by orientation.
 4. **Extrude/revolve** onto a B-rep body with stable face identifiers so features can re-find their references.
 5. **History rebuild**: every feature re-evaluated in order, with a topological naming strategy that survives an earlier

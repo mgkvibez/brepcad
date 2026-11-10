@@ -32,7 +32,18 @@ export type Constraint =
   | { readonly kind: "coincident"; readonly lineA: string; readonly endA: End; readonly lineB: string; readonly endB: End }
   | { readonly kind: "fixed"; readonly line: string; readonly at: End; readonly x: number; readonly y: number }
   | { readonly kind: "parallel"; readonly lineA: string; readonly lineB: string }
-  | { readonly kind: "perpendicular"; readonly lineA: string; readonly lineB: string };
+  | { readonly kind: "perpendicular"; readonly lineA: string; readonly lineB: string }
+  | {
+      readonly kind: "distance";
+      readonly lineA: string;
+      readonly endA: End;
+      readonly lineB: string;
+      readonly endB: End;
+      /** The length the two points must be apart. Positive: zero distance is what `coincident` is for. */
+      readonly value: number;
+    }
+  | { readonly kind: "angle"; readonly lineA: string; readonly lineB: string; readonly degrees: number }
+  | { readonly kind: "tangent"; readonly lineA: string; readonly lineB: string };
 
 export class ConstraintError extends Error {
   constructor(message: string) {
@@ -100,6 +111,10 @@ class Q {
     return new Q(-this.n, this.d);
   }
 
+  isNegative(): boolean {
+    return this.n < 0n;
+  }
+
   isZero(): boolean {
     return this.n === 0n;
   }
@@ -140,30 +155,48 @@ function gcd(a: bigint, b: bigint): bigint {
   return x === 0n ? 1n : x;
 }
 
-/** Bit length of a rational's magnitude, used only to notice a diverging iterate. */
-function magnitudeBits(value: Q): number {
-  const numerator = value.n < 0n ? -value.n : value.n;
-  return numerator.toString(2).length;
-}
 
 const ZERO = new Q(0n, 1n);
 const ONE = new Q(1n, 1n);
 
 type Row = { coefficients: Q[]; target: Q; label: string };
 
-/** An angular constraint, resolved to line indices. Its equation is quadratic, which is why it is iterated. */
-interface AngularPair {
-  readonly kind: "parallel" | "perpendicular";
+/**
+ * A constraint whose equation is quadratic in the coordinates, resolved to line indices.
+ *
+ * `parallel`, `perpendicular` and `angle` equate a determinant or a dot product, which is homogeneous and scale free.
+ * `distance` equates `|P - Q|²` to a squared length, so it carries a target rather than being homogeneous. Both sorts
+ * are iterated the same way: linearise about the current configuration and solve that exactly.
+ */
+interface QuadraticPair {
+  readonly kind: "parallel" | "perpendicular" | "angle" | "distance" | "keepLength";
   readonly a: number;
   readonly b: number;
   readonly label: string;
+  /**
+   * Distance target in sketch units for `distance`; the squared length to hold for `keepLength`, which is an internal
+   * gauge rather than a constraint and never appears in a report.
+   */
+  readonly value?: Q;
+  /** The angle's target as an exact pair, so the residual can be computed without trigonometry. Present for `angle`. */
+  readonly cos?: Q;
+  readonly sin?: Q;
+  readonly endA?: End;
+  readonly endB?: End;
+}
+
+/** Where a line's endpoint lives in the unknown vector. */
+function coordinate(lineIndex: number, end: End, axis: 0 | 1): number {
+  return lineIndex * 4 + (end === "end" ? 2 : 0) + axis;
 }
 
 interface BuiltSystem {
   readonly rows: Row[];
-  readonly angular: AngularPair[];
+  readonly quadratic: QuadraticPair[];
   readonly unknownCount: number;
   readonly u0: Q[];
+  /** Lines whose length a `distance` constraint already pins, so the gauge below has nothing to add for them. */
+  readonly lengthPinned: Set<number>;
 }
 
 function buildSystem(lines: readonly LineEntity[], constraints: readonly Constraint[]): BuiltSystem {
@@ -177,14 +210,12 @@ function buildSystem(lines: readonly LineEntity[], constraints: readonly Constra
   }
 
   const rows: Row[] = [];
-  const angular: AngularPair[] = [];
+  const quadratic: QuadraticPair[] = [];
   const requireLine = (id: string, label: string): number => {
     const index = ids.get(id);
     if (index === undefined) throw new ConstraintError(`${label} refers to unknown line "${id}"`);
     return index;
   };
-  const coordinate = (lineIndex: number, end: End, axis: 0 | 1): number =>
-    lineIndex * 4 + (end === "end" ? 2 : 0) + axis;
 
   for (const constraint of constraints) {
     switch (constraint.kind) {
@@ -238,17 +269,96 @@ function buildSystem(lines: readonly LineEntity[], constraints: readonly Constra
             `${constraint.kind}(${constraint.lineA}, ${constraint.lineB}) constrains a line against itself`,
           );
         }
-        angular.push({ kind: constraint.kind, a, b, label: `${constraint.kind}(${constraint.lineA}, ${constraint.lineB})` });
+        quadratic.push({
+          kind: constraint.kind,
+          a,
+          b,
+          label: `${constraint.kind}(${constraint.lineA}, ${constraint.lineB})`,
+        });
+        break;
+      }
+      case "distance": {
+        const a = requireLine(constraint.lineA, "distance");
+        const b = requireLine(constraint.lineB, "distance");
+        if (a === b && constraint.endA === constraint.endB) {
+          throw new ConstraintError(
+            `distance(${constraint.lineA}.${constraint.endA}, ${constraint.lineB}.${constraint.endB}) is between a ` +
+              "point and itself, which is zero for every sketch",
+          );
+        }
+        if (!(constraint.value > 0)) {
+          throw new ConstraintError(
+            `distance(${constraint.lineA}.${constraint.endA}, ${constraint.lineB}.${constraint.endB}) must be a ` +
+              `positive length, got ${constraint.value}`,
+          );
+        }
+        quadratic.push({
+          kind: "distance",
+          a,
+          b,
+          value: Q.from(constraint.value),
+          endA: constraint.endA,
+          endB: constraint.endB,
+          label:
+            `distance(${constraint.lineA}.${constraint.endA}, ` +
+            `${constraint.lineB}.${constraint.endB}) = ${constraint.value}`,
+        });
+        break;
+      }
+      case "angle": {
+        const a = requireLine(constraint.lineA, "angle");
+        const b = requireLine(constraint.lineB, "angle");
+        if (a === b) {
+          throw new ConstraintError(
+            `angle(${constraint.lineA}, ${constraint.lineB}) constrains a line against itself`,
+          );
+        }
+        if (!(constraint.degrees > 0 && constraint.degrees < 180)) {
+          throw new ConstraintError(
+            `angle(${constraint.lineA}, ${constraint.lineB}) must be between 0 and 180 degrees, got ` +
+              `${constraint.degrees}: 0 and 180 are parallel and 90 is perpendicular, and those have their own names`,
+          );
+        }
+        const radians = (constraint.degrees * Math.PI) / 180;
+        // Two orientations satisfy "45° between these lines": one on each side. Which one is meant is decided by the
+        // side the sketch is already drawn on, so the solver makes the small correction instead of swinging the line
+        // around to the mirror answer. To get the other side, swap the line's endpoints.
+        const firstDirection = direction(u0, a);
+        const secondDirection = direction(u0, b);
+        const currentDet = firstDirection.dx
+          .mul(secondDirection.dy)
+          .sub(firstDirection.dy.mul(secondDirection.dx));
+        const side = currentDet.isNegative() ? -1 : 1;
+        quadratic.push({
+          kind: "angle",
+          a,
+          b,
+          cos: Q.from(Math.cos(radians)),
+          sin: Q.from(side * Math.sin(radians)),
+          label: `angle(${constraint.lineA}, ${constraint.lineB}) = ${constraint.degrees}°`,
+        });
         break;
       }
       default: {
-        const never: never = constraint;
+        const never: { readonly kind: string } = constraint;
+        if (never.kind === "tangent") {
+          throw new ConstraintError(
+            "tangent is refused by name rather than skipped: tangency is a statement about an arc's radius and centre, " +
+              "and arcs are not part of the solver's unknowns yet, so there is nothing here for it to constrain. " +
+              "Constrain the centre line of the arc with distance and angle instead, or leave the arc unconstrained",
+          );
+        }
         throw new ConstraintError(`unsupported constraint ${JSON.stringify(never)}`);
       }
     }
   }
 
-  return { rows, angular, unknownCount, u0 };
+  const lengthPinned = new Set<number>();
+  for (const pair of quadratic) {
+    if (pair.kind === "distance" && pair.a === pair.b) lengthPinned.add(pair.a);
+  }
+
+  return { rows, quadratic, unknownCount, u0, lengthPinned };
 }
 
 /** A line's direction vector as an exact rational pair. */
@@ -262,60 +372,106 @@ function squaredNorm(vector: { dx: Q; dy: Q }): Q {
 }
 
 /**
- * The angular equation's exact value: a determinant for parallel (zero when the directions are collinear) and a dot
- * product for perpendicular (zero when they are at right angles).
+ * The exact value of a quadratic constraint, in rationals. Zero means satisfied.
+ *
+ * `parallel` is the determinant of the two directions (zero when collinear), `perpendicular` their dot product (zero when
+ * at right angles), `angle` the same pair combined as `det·cosθ - dot·sinθ`, which is `|u||v|·sin(φ - θ)` and
+ * therefore zero exactly when the angle between the lines is θ. `distance` is `|P - Q|² - d²`, the squared form because
+ * the unsquared one is not polynomial and would break the exactness arithmetic.
  */
-function angularValue(pair: AngularPair, u: readonly Q[]): Q {
+function quadraticValue(pair: QuadraticPair, u: readonly Q[]): Q {
   const first = direction(u, pair.a);
   const second = direction(u, pair.b);
-  return pair.kind === "parallel"
-    ? first.dx.mul(second.dy).sub(first.dy.mul(second.dx))
-    : first.dx.mul(second.dx).add(first.dy.mul(second.dy));
+  const det = first.dx.mul(second.dy).sub(first.dy.mul(second.dx));
+  const dotProduct = first.dx.mul(second.dx).add(first.dy.mul(second.dy));
+
+  switch (pair.kind) {
+    case "parallel":
+      return det;
+    case "perpendicular":
+      return dotProduct;
+    case "angle":
+      return det.mul(pair.cos!).sub(dotProduct.mul(pair.sin!));
+    case "keepLength":
+    case "distance": {
+      const firstPoint = { x: u[coordinate(pair.a, pair.endA!, 0)]!, y: u[coordinate(pair.a, pair.endA!, 1)]! };
+      const secondPoint = { x: u[coordinate(pair.b, pair.endB!, 0)]!, y: u[coordinate(pair.b, pair.endB!, 1)]! };
+      const dx = firstPoint.x.sub(secondPoint.x);
+      const dy = firstPoint.y.sub(secondPoint.y);
+      return dx.mul(dx).add(dy.mul(dy)).sub(pair.value!.mul(pair.value!));
+    }
+  }
+}
+
+/** Writes the gradient of the determinant of two directions into `row`. */
+function detGradient(row: Q[], first: { dx: Q; dy: Q }, second: { dx: Q; dy: Q }, baseA: number, baseB: number): void {
+  // d(det)/d(A.start) = (-vy, vx), d/d(A.end) = (vy, -vx), d/d(B.start) = (uy, -ux), d/d(B.end) = (-uy, ux)
+  row[baseA] = second.dy.neg();
+  row[baseA + 1] = second.dx;
+  row[baseA + 2] = second.dy;
+  row[baseA + 3] = second.dx.neg();
+  row[baseB] = first.dy;
+  row[baseB + 1] = first.dx.neg();
+  row[baseB + 2] = first.dy.neg();
+  row[baseB + 3] = first.dx;
+}
+
+/** Writes the gradient of the dot product of two directions into `row`. */
+function dotGradient(row: Q[], first: { dx: Q; dy: Q }, second: { dx: Q; dy: Q }, baseA: number, baseB: number): void {
+  // d(dot)/d(A.start) = (-vx, -vy), d/d(A.end) = (vx, vy), d/d(B.start) = (-ux, -uy), d/d(B.end) = (ux, uy)
+  row[baseA] = second.dx.neg();
+  row[baseA + 1] = second.dy.neg();
+  row[baseA + 2] = second.dx;
+  row[baseA + 3] = second.dy;
+  row[baseB] = first.dx.neg();
+  row[baseB + 1] = first.dy.neg();
+  row[baseB + 2] = first.dx;
+  row[baseB + 3] = first.dy;
 }
 
 /**
- * The tangent row of an angular constraint, taken at `u`.
+ * The Newton row of a quadratic constraint, taken at `u`.
  *
  * The gradient of `det(u, v)` and of `u·v` are both linear in the *other* line's direction, so freezing both directions
  * at `u` turns the quadratic into one linear equation: the change that removes the current error to first order. When a
  * line's direction cannot move (it is pinned by `fixed`, `horizontal` or `vertical`), this row is not an approximation
  * at all, and the solve lands on the constraint exactly; `solveSketch` reports which case happened.
+ *
+ * `distance` is the same idea without the freezing: its gradient, `2(P - Q)` at one end and `-2(P - Q)` at the other, is
+ * linear in the coordinates, so the row is the honest gradient of a quadratic and Newton converges on it quadratically.
  */
-function angularRow(pair: AngularPair, u: readonly Q[], unknownCount: number): Row {
-  const first = direction(u, pair.a);
-  const second = direction(u, pair.b);
+function quadraticRow(pair: QuadraticPair, u: readonly Q[], unknownCount: number): Row {
   const row = zeroRow(unknownCount);
   const baseA = pair.a * 4;
   const baseB = pair.b * 4;
 
-  if (pair.kind === "parallel") {
-    // d(det)/d(A.start) = (-vy, vx), d/d(A.end) = (vy, -vx), d/d(B.start) = (uy, -ux), d/d(B.end) = (-uy, ux)
-    row[baseA] = second.dy.neg();
-    row[baseA + 1] = second.dx;
-    row[baseA + 2] = second.dy;
-    row[baseA + 3] = second.dx.neg();
-    row[baseB] = first.dy;
-    row[baseB + 1] = first.dx.neg();
-    row[baseB + 2] = first.dy.neg();
-    row[baseB + 3] = first.dx;
+  if (pair.kind === "distance" || pair.kind === "keepLength") {
+    const firstPoint = { x: u[coordinate(pair.a, pair.endA!, 0)]!, y: u[coordinate(pair.a, pair.endA!, 1)]! };
+    const secondPoint = { x: u[coordinate(pair.b, pair.endB!, 0)]!, y: u[coordinate(pair.b, pair.endB!, 1)]! };
+    const TWO = new Q(2n, 1n);
+    const dx = firstPoint.x.sub(secondPoint.x).mul(TWO);
+    const dy = firstPoint.y.sub(secondPoint.y).mul(TWO);
+    row[coordinate(pair.a, pair.endA!, 0)] = dx;
+    row[coordinate(pair.a, pair.endA!, 1)] = dy;
+    row[coordinate(pair.b, pair.endB!, 0)] = dx.neg();
+    row[coordinate(pair.b, pair.endB!, 1)] = dy.neg();
   } else {
-    // d(dot)/d(A.start) = (-vx, -vy), d/d(A.end) = (vx, vy), d/d(B.start) = (-ux, -uy), d/d(B.end) = (ux, uy)
-    row[baseA] = second.dx.neg();
-    row[baseA + 1] = second.dy.neg();
-    row[baseA + 2] = second.dx;
-    row[baseA + 3] = second.dy;
-    row[baseB] = first.dx.neg();
-    row[baseB + 1] = first.dy.neg();
-    row[baseB + 2] = first.dx;
-    row[baseB + 3] = first.dy;
+    const first = direction(u, pair.a);
+    const second = direction(u, pair.b);
+    const detPart = zeroRow(unknownCount);
+    const dotPart = zeroRow(unknownCount);
+    detGradient(detPart, first, second, baseA, baseB);
+    dotGradient(dotPart, first, second, baseA, baseB);
+    const detWeight = pair.kind === "parallel" ? ONE : pair.kind === "angle" ? pair.cos! : ZERO;
+    const dotWeight =
+      pair.kind === "parallel" ? ZERO : pair.kind === "perpendicular" ? ONE : pair.sin!.neg();
+    for (let index = 0; index < unknownCount; index += 1) {
+      row[index] = detPart[index]!.mul(detWeight).add(dotPart[index]!.mul(dotWeight));
+    }
   }
 
   const current = dot(row, u);
-  return {
-    coefficients: row,
-    target: current.sub(angularValue(pair, u)),
-    label: pair.label,
-  };
+  return { coefficients: row, target: current.sub(quadraticValue(pair, u)), label: pair.label };
 }
 
 /**
@@ -332,11 +488,11 @@ function angularRow(pair: AngularPair, u: readonly Q[], unknownCount: number): R
 export function solveLines(lines: readonly LineEntity[], constraints: readonly Constraint[]): LineEntity[] {
   if (lines.length === 0) return [];
   const built = buildSystem(lines, constraints);
-  const first = built.angular[0];
+  const first = built.quadratic[0];
   if (first !== undefined) {
     throw new ConstraintError(
-      `${first.label} is angular, not linear: solveLines solves only constraints that are exactly linear in the ` +
-        "coordinates. Use solveSketch, which iterates the angular ones and reports the residual it reached",
+      `${first.label} is quadratic, not linear: solveLines solves only constraints that are exactly linear in the ` +
+        "coordinates. Use solveSketch, which iterates the quadratic ones and reports the residual it reached",
     );
   }
   if (built.rows.length === 0) return lines.map((line) => ({ ...line }));
@@ -347,8 +503,11 @@ export interface SolveReport {
   readonly lines: readonly LineEntity[];
   /** Linear solves performed. One when every constraint was linear; more when angular ones had to be iterated. */
   readonly iterations: number;
-  /** Worst relative angular error: `|sin|` for parallel, `|cos|` for perpendicular. Zero means exact. */
-  readonly angularResidual: number;
+  /**
+   * Worst relative error across the quadratic constraints: `|sin|` for parallel, `|cos|` for perpendicular,
+   * `|sin(φ-θ)|` for an angle, and the relative length error for a distance. Zero means exact.
+   */
+  readonly residual: number;
   /** True when every angular constraint holds exactly in rationals, not merely within tolerance. */
   readonly exact: boolean;
 }
@@ -388,20 +547,20 @@ export function solveSketch(
   constraints: readonly Constraint[],
   options: SolveOptions = {},
 ): SolveReport {
-  if (lines.length === 0) return { lines: [], iterations: 0, angularResidual: 0, exact: true };
+  if (lines.length === 0) return { lines: [], iterations: 0, residual: 0, exact: true };
   const built = buildSystem(lines, constraints);
   const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
 
-  if (built.angular.length === 0) {
+  if (built.quadratic.length === 0) {
     const solved =
       built.rows.length === 0
         ? lines.map((line) => ({ ...line }))
         : toLines(solveSystem(built.u0, built.rows), lines);
-    return { lines: solved, iterations: built.rows.length === 0 ? 0 : 1, angularResidual: 0, exact: true };
+    return { lines: solved, iterations: built.rows.length === 0 ? 0 : 1, residual: 0, exact: true };
   }
 
-  for (const pair of built.angular) {
+  for (const pair of built.quadratic) {
     for (const index of [pair.a, pair.b]) {
       if (squaredNorm(direction(built.u0, index)).isZero()) {
         throw new ConstraintError(
@@ -414,39 +573,90 @@ export function solveSketch(
   // The linear rows alone first, so every angular row below is linearised about a configuration that obeys them.
   let current = built.rows.length === 0 ? built.u0 : solveSystem(built.u0, built.rows);
   let iterations = built.rows.length === 0 ? 0 : 1;
-  checkRepresentable(current, lines, built.angular);
+  checkRepresentable(current, lines, built.quadratic);
 
   for (let step = 0; ; step += 1) {
-    const report = measure(built.angular, current);
+    const report = measure(built.quadratic, current);
     const settled = {
       lines: toLines(current, lines),
       iterations,
-      angularResidual: report.residual,
+      residual: report.residual,
       exact: report.exact,
     };
     if (report.exact || report.residual <= tolerance) return settled;
     if (step === maxIterations) {
       throw new ConstraintError(
         `angular constraints did not converge in ${maxIterations} iterations: ` +
-          `${built.angular.map((pair) => pair.label).join(", ")} still off by ${report.residual}`,
+          `${built.quadratic.map((pair) => pair.label).join(", ")} still off by ${report.residual}`,
       );
     }
-    const rows = [...built.rows, ...built.angular.map((pair) => angularRow(pair, current, built.unknownCount))];
-    const next = solveSystem(current, rows);
+    const rows = [...built.rows, ...built.quadratic.map((pair) => quadraticRow(pair, current, built.unknownCount))];
+    const next = preserveLengths(built, current, solveSystem(current, rows));
     iterations += 1;
-    checkRepresentable(next, lines, built.angular);
+    checkRepresentable(next, lines, built.quadratic);
     const moved = next.some((value, index) => !value.sub(current[index]!).isZero());
     if (!moved) {
       throw new ConstraintError(
-        `${built.angular.map((pair) => pair.label).join(", ")} cannot be satisfied: the solver stopped moving with a ` +
+        `${built.quadratic.map((pair) => pair.label).join(", ")} cannot be satisfied: the solver stopped moving with a ` +
           `relative error of ${report.residual}`,
       );
     }
-    current = next;
+    current = reanchored(next);
   }
 }
 
+/** The lines an angular constraint acts on and no `distance` constraint has already pinned. */
+function gaugeTargets(built: BuiltSystem): number[] {
+  const targets = new Set<number>();
+  for (const pair of built.quadratic) {
+    if (pair.kind === "distance" || pair.kind === "keepLength") continue;
+    for (const index of [pair.a, pair.b]) {
+      if (!built.lengthPinned.has(index)) targets.add(index);
+    }
+  }
+  return [...targets];
+}
+
 /**
+ * Removes the part of a Newton step that shrinks a line, leaving the rotation.
+ *
+ * Every angular equation here is homogeneous of degree two, so `u = 0` satisfies it trivially and a step taken along the
+ * gradient always has a radial component pointing inwards. Measured on `angle(b, a) = 45°` over a 10-long horizontal and
+ * an 11.7-long line at 31°: the residual fell 113 → 27.9 as expected, both lines then halved in length, and the next
+ * iterations ran past every bound the solver has. Projecting the step back onto "the length does not change" makes it a
+ * rotation about the endpoints' midpoint, which is what "make this line 45° to that one" means, and which a caller can
+ * draw.
+ *
+ * The projection is `(ΔP - ΔQ)·(P - Q) = 0`, solved by shifting one end up and the other down by the same amount so
+ * the midpoint stays put, and done in exact rationals like everything else. Lines whose length a `distance` constraint
+ * already fixes are left alone, and so is a length the caller is asking to change.
+ */
+function preserveLengths(built: BuiltSystem, before: readonly Q[], after: readonly Q[]): Q[] {
+  const out = after.slice();
+  const half = new Q(1n, 2n);
+  for (const index of gaugeTargets(built)) {
+    const base = index * 4;
+    const dx = before[base + 2]!.sub(before[base]!);
+    const dy = before[base + 3]!.sub(before[base + 1]!);
+    const squared = dx.mul(dx).add(dy.mul(dy));
+    if (squared.isZero()) continue;
+    const moveX = out[base]!.sub(before[base]!).sub(out[base + 2]!.sub(before[base + 2]!));
+    const moveY = out[base + 1]!.sub(before[base + 1]!).sub(out[base + 3]!.sub(before[base + 3]!));
+    const radial = moveX.mul(dx).add(moveY.mul(dy));
+    if (radial.isZero()) continue;
+    const correction = radial.div(squared).mul(half);
+    const shiftX = correction.mul(dx);
+    const shiftY = correction.mul(dy);
+    out[base] = out[base]!.sub(shiftX);
+    out[base + 1] = out[base + 1]!.sub(shiftY);
+    out[base + 2] = out[base + 2]!.add(shiftX);
+    out[base + 3] = out[base + 3]!.add(shiftY);
+  }
+  return out;
+}
+
+/**
+ * Refuse a configuration that a caller could not draw./**
  * Refuse a configuration that a caller could not draw.
  *
  * Three ways the iteration can go wrong while still producing numbers: a coordinate too large for a double (which used
@@ -459,9 +669,27 @@ export function solveSketch(
  * tripling per step. Without a bound the solver does not produce a wrong answer, it never returns one; the default
  * budget of 32 iterations would mean rationals with more digits than there are atoms in the room.
  */
-const MAX_COORDINATE_BITS = 256;
+const MAX_COORDINATE = 1e12;
 
-function checkRepresentable(u: readonly Q[], lines: readonly LineEntity[], angular: readonly AngularPair[]): void {
+/**
+ * Rounds a step's result to the doubles it will be reported as.
+ *
+ * The exactness of a step is not in doubt; the size of its denominators is. An exact rational target such as
+ * `cos 45° = 0.7071067811865461` is a fraction with a 53-bit denominator, and each iteration multiplies the geometry by
+ * it and by the Lagrange multipliers, so the bit length roughly doubles per step. Measured on `angle = 45°`: exact in
+ * every step, and by the third step the coordinates were ~10 in value with numerators past 2^256, which the solver took
+ * for a runaway and refused. Re-anchoring each step to the double the caller will receive keeps the rationals at the width of
+ * the numbers the API actually returns, and changes no result that could be observed through it.
+ */
+function reanchored(u: readonly Q[]): Q[] {
+  return u.map((value) => Q.from(value.toNumber()));
+}
+
+function checkRepresentable(
+  u: readonly Q[],
+  lines: readonly LineEntity[],
+  quadratic: readonly QuadraticPair[],
+): void {
   for (let index = 0; index < lines.length; index += 1) {
     const base = index * 4;
     const values = [u[base]!, u[base + 1]!, u[base + 2]!, u[base + 3]!];
@@ -471,16 +699,16 @@ function checkRepresentable(u: readonly Q[], lines: readonly LineEntity[], angul
           "the largest number a double can represent, which means they cannot all be satisfied",
       );
     }
-    const widest = values.reduce((bits, value) => Math.max(bits, magnitudeBits(value)), 0);
-    if (widest > MAX_COORDINATE_BITS) {
+    const widest = values.reduce((most, value) => Math.max(most, Math.abs(value.toNumber())), 0);
+    if (widest > MAX_COORDINATE) {
       throw new ConstraintError(
         `line "${lines[index]!.id}" left the range a sketch can hold while satisfying ` +
-          `${angular.map((pair) => pair.label).join(", ")}: its coordinates grew past 2^${MAX_COORDINATE_BITS}, which ` +
-          "no drawing reaches, so those constraints cannot all be satisfied",
+          `${quadratic.map((pair) => pair.label).join(", ")}: its coordinates grew past ${MAX_COORDINATE}, which no ` +
+          "drawing reaches, so those constraints cannot all be satisfied",
       );
     }
-    if (angular.length > 0 && squaredNorm(direction(u, index)).isZero()) {
-      const named = angular
+    if (quadratic.length > 0 && squaredNorm(direction(u, index)).isZero()) {
+      const named = quadratic
         .filter((pair) => pair.a === index || pair.b === index)
         .map((pair) => pair.label)
         .join(", ");
@@ -493,24 +721,38 @@ function checkRepresentable(u: readonly Q[], lines: readonly LineEntity[], angul
 }
 
 /**
- * The worst relative angular error across every pair, plus whether all of them are exactly zero.
+ * The worst relative error across every quadratic constraint, plus whether all of them are exactly zero.
  *
  * Exactness is decided in rationals, where "zero" means zero. The reported number is computed in doubles on purpose:
  * the rational ratio `g² / (|u|²|v|²)` has a numerator and denominator that both grow with every iteration, and
  * converting that quotient overflows to Infinity long before the geometry is anywhere near wrong.
+ *
+ * The four kinds are made comparable by dividing by the scale each one is homogeneous in: two line lengths for the
+ * angular ones, the target length squared for a distance. What comes out is dimensionless, so "1e-12" means the same
+ * thing whether the sketch is drawn in millimetres or in metres.
  */
-function measure(angular: readonly AngularPair[], u: readonly Q[]): { exact: boolean; residual: number } {
+function measure(quadratic: readonly QuadraticPair[], u: readonly Q[]): { exact: boolean; residual: number } {
   let worst = 0;
   let exact = true;
-  for (const pair of angular) {
+  for (const pair of quadratic) {
+    if (pair.kind === "keepLength") continue;
     const first = direction(u, pair.a);
     const second = direction(u, pair.b);
-    // a collapsed line satisfies both angular equations trivially, which is not a sketch anyone wants
-    if (squaredNorm(first).isZero() || squaredNorm(second).isZero()) {
+    // a collapsed line satisfies every angular equation trivially, which is not a sketch anyone wants
+    if (pair.kind !== "distance" && (squaredNorm(first).isZero() || squaredNorm(second).isZero())) {
       return { exact: false, residual: Number.POSITIVE_INFINITY };
     }
-    if (angularValue(pair, u).isZero()) continue;
+    if (quadraticValue(pair, u).isZero()) continue;
     exact = false;
+
+    if (pair.kind === "distance") {
+      const dx = u[coordinate(pair.a, pair.endA!, 0)]!.toNumber() - u[coordinate(pair.b, pair.endB!, 0)]!.toNumber();
+      const dy = u[coordinate(pair.a, pair.endA!, 1)]!.toNumber() - u[coordinate(pair.b, pair.endB!, 1)]!.toNumber();
+      const error = Math.abs(Math.hypot(dx, dy) - pair.value!.toNumber()) / pair.value!.toNumber();
+      if (error > worst) worst = error;
+      continue;
+    }
+
     const ax = first.dx.toNumber();
     const ay = first.dy.toNumber();
     const bx = second.dx.toNumber();
@@ -518,10 +760,15 @@ function measure(angular: readonly AngularPair[], u: readonly Q[]): { exact: boo
     const normA = Math.hypot(ax, ay);
     const normB = Math.hypot(bx, by);
     if (normA === 0 || normB === 0) return { exact: false, residual: Number.POSITIVE_INFINITY };
+    const det = ax * by - ay * bx;
+    const dotProduct = ax * bx + ay * by;
+    const scale = normA * normB;
     const error =
       pair.kind === "parallel"
-        ? Math.abs(ax * by - ay * bx) / (normA * normB)
-        : Math.abs(ax * bx + ay * by) / (normA * normB);
+        ? Math.abs(det) / scale
+        : pair.kind === "perpendicular"
+          ? Math.abs(dotProduct) / scale
+          : Math.abs(det * pair.cos!.toNumber() - dotProduct * pair.sin!.toNumber()) / scale;
     if (error > worst) worst = error;
   }
   return { exact, residual: worst };
