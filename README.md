@@ -45,9 +45,29 @@ length does not change", which leaves a rotation about the endpoints' midpoint, 
 every step multiplies through, so by the third step the coordinates were ~10 in value with numerators past 2^256; each
 step is now re-anchored to the doubles the caller will actually receive, which is what the API returns anyway.
 
-Three things are refused by name instead of approximated. `tangent` is rejected with the reason: tangency is a statement
-about an arc's radius and centre, arcs are not among the solver's unknowns yet, so there is nothing for it to constrain
-and it is not silently skipped. So is a set that cannot hold together: `parallel` and `perpendicular` over the same pair
+### Tangency, which is what made arcs solver unknowns
+
+`tangent(line, arc)` works, and it is the reason arcs entered the solver at all. An arc contributes its centre as two
+unknowns, and its radius is a given: "make this tangent" is a statement about position, so a tangency allowed to resize
+the arc would satisfy itself by shrinking it. The equation is `det(d, c - p)² - r²|d|² = 0`, the squared form because the
+unsquared perpendicular distance is not polynomial and would break the exact arithmetic, with `d` the line's direction,
+`p` its start and `c` the centre.
+
+Two things about it are worth naming because they are where a naive version goes wrong:
+
+1. The `-2r²|d|²` term is not decoration. Without it the gradient only ever asks for "move until the perpendicular
+   distance is `r`", and a line collapsed to a point satisfies that for every arc. The term resists the collapse, and the
+   length gauge below keeps the line the length it was drawn.
+2. A pin outranks a gauge. The length gauge works by moving one end up and the other down by the same amount, which is
+   invisible on a free line and a broken constraint on a pinned one: measured on `tangent(wall, c)` with both ends of the
+   wall fixed, the solve moved the arc correctly and then shifted the wall's endpoints by ±0.0104 to restore its length,
+   putting two pinned points off their pins. The gauge now skips any line with a pinned coordinate, and `fixedArc` pins an
+   arc centre so the line is the thing that moves when that is what the user meant.
+
+Two refusals came with it, both named rather than approximated: an arc id that names a line, and an arc with no radius,
+because a point has no tangent to be on.
+
+Two things are still refused by name. A set that cannot hold together: `parallel` and `perpendicular` over the same pair
 have no solution except a collapsed line, the two rows fight, the step stops moving, and the refusal names the
 constraints instead of running until the rationals are astronomical. And a failure to converge inside the iteration
 budget is an error, not a sketch that looks approximately square.
@@ -59,7 +79,7 @@ arc sweep handling including full turns, signed area by the shoelace rule with e
 boxes that account for the axis crossings an arc sweeps through. On top of it, the constrained-geometry layer described
 above. There is no extruder, no B-rep topology and no kernel integration yet.
 
-**Tests:** 44
+**Tests:** 51
 
 ```bash
 npm ci && npm run verify

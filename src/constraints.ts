@@ -12,7 +12,12 @@
  * Linear constraints (`horizontal`, `vertical`, `coincident`, `fixed`) are solved exactly and once. Angular ones
  * (`parallel`, `perpendicular`) are quadratic in the coordinates, so they cannot be solved by that method at all:
  * `solveLines` refuses them by name, and `solveSketch` iterates them, each step an exact rational projection, and
- * reports the residual it reached plus whether the answer came out exact. Tangency stays refused by name.
+ * reports the residual it reached plus whether the answer came out exact.
+ *
+ * Tangency is a line against an arc, and it needs the arc's centre as an unknown, which is why arcs joined the solver
+ * rather than being approximated as a line. An arc's radius stays what the user drew; tangency moves the centre or the
+ * line, never the radius, because "make this tangent" is a statement about position and a silently resized arc is a
+ * different drawing.
  */
 
 import type { Vec2 } from "./sketch.js";
@@ -24,6 +29,22 @@ export interface LineEntity {
   readonly end: Vec2;
 }
 
+/**
+ * A circular arc the solver may move.
+ *
+ * Only its centre is an unknown. The radius is a given: it is what the user drew, and a tangency constraint that was
+ * allowed to change it would satisfy itself by shrinking the arc. The sweep (`start`, `end`) is carried through untouched,
+ * because nothing here reasons about which part of the circle is drawn.
+ */
+export interface ArcEntity {
+  readonly kind: "arc";
+  readonly id: string;
+  readonly centre: Vec2;
+  readonly radius: number;
+  readonly start?: number;
+  readonly end?: number;
+}
+
 export type End = "start" | "end";
 
 export type Constraint =
@@ -31,6 +52,7 @@ export type Constraint =
   | { readonly kind: "vertical"; readonly line: string }
   | { readonly kind: "coincident"; readonly lineA: string; readonly endA: End; readonly lineB: string; readonly endB: End }
   | { readonly kind: "fixed"; readonly line: string; readonly at: End; readonly x: number; readonly y: number }
+  | { readonly kind: "fixedArc"; readonly arc: string; readonly x: number; readonly y: number }
   | { readonly kind: "parallel"; readonly lineA: string; readonly lineB: string }
   | { readonly kind: "perpendicular"; readonly lineA: string; readonly lineB: string }
   | {
@@ -43,7 +65,11 @@ export type Constraint =
       readonly value: number;
     }
   | { readonly kind: "angle"; readonly lineA: string; readonly lineB: string; readonly degrees: number }
-  | { readonly kind: "tangent"; readonly lineA: string; readonly lineB: string };
+  | {
+      readonly kind: "tangent";
+      readonly line: string;
+      readonly arc: string;
+    };
 
 export class ConstraintError extends Error {
   constructor(message: string) {
@@ -169,7 +195,7 @@ type Row = { coefficients: Q[]; target: Q; label: string };
  * are iterated the same way: linearise about the current configuration and solve that exactly.
  */
 interface QuadraticPair {
-  readonly kind: "parallel" | "perpendicular" | "angle" | "distance" | "keepLength";
+  readonly kind: "parallel" | "perpendicular" | "angle" | "distance" | "keepLength" | "tangent";
   readonly a: number;
   readonly b: number;
   readonly label: string;
@@ -183,6 +209,8 @@ interface QuadraticPair {
   readonly sin?: Q;
   readonly endA?: End;
   readonly endB?: End;
+  /** Where the arc's centre lives in the unknown vector. Present for `tangent`. */
+  readonly arcBase?: number;
 }
 
 /** Where a line's endpoint lives in the unknown vector. */
@@ -199,15 +227,30 @@ interface BuiltSystem {
   readonly lengthPinned: Set<number>;
 }
 
-function buildSystem(lines: readonly LineEntity[], constraints: readonly Constraint[]): BuiltSystem {
+function buildSystem(
+  lines: readonly LineEntity[],
+  constraints: readonly Constraint[],
+  arcs: readonly ArcEntity[] = [],
+): BuiltSystem {
   const ids = new Map<string, number>();
   lines.forEach((line, index) => ids.set(line.id, index));
-  const unknownCount = lines.length * 4;
+  const unknownCount = lines.length * 4 + arcs.length * 2;
 
   const u0: Q[] = [];
   for (const line of lines) {
     u0.push(Q.from(line.start.x), Q.from(line.start.y), Q.from(line.end.x), Q.from(line.end.y));
   }
+  // arc centres follow every line coordinate, so a line's position in the unknown vector never depends on how many arcs
+  // the sketch has
+  for (const arc of arcs) {
+    u0.push(Q.from(arc.centre.x), Q.from(arc.centre.y));
+  }
+
+  const requireArc = (id: string, label: string): { index: number; base: number } => {
+    const index = arcs.findIndex((arc) => arc.id === id);
+    if (index === -1) throw new ConstraintError(`${label} refers to unknown arc "${id}"`);
+    return { index, base: lines.length * 4 + index * 2 };
+  };
 
   const rows: Row[] = [];
   const quadratic: QuadraticPair[] = [];
@@ -339,16 +382,52 @@ function buildSystem(lines: readonly LineEntity[], constraints: readonly Constra
         });
         break;
       }
-      default: {
-        const never: { readonly kind: string } = constraint;
-        if (never.kind === "tangent") {
+      case "fixedArc": {
+        const arc = requireArc(constraint.arc, "fixedArc");
+        const xRow = zeroRow(unknownCount);
+        xRow[arc.base] = ONE;
+        rows.push({
+          coefficients: xRow,
+          target: Q.from(constraint.x),
+          label: `fixedArc(${constraint.arc}).x`,
+        });
+        const yRow = zeroRow(unknownCount);
+        yRow[arc.base + 1] = ONE;
+        rows.push({
+          coefficients: yRow,
+          target: Q.from(constraint.y),
+          label: `fixedArc(${constraint.arc}).y`,
+        });
+        break;
+      }
+      case "tangent": {
+        const line = requireLine(constraint.line, "tangent");
+        const arc = requireArc(constraint.arc, "tangent");
+        const radius = arcs[arc.index]!.radius;
+        if (!(radius > 0) || !Number.isFinite(radius)) {
           throw new ConstraintError(
-            "tangent is refused by name rather than skipped: tangency is a statement about an arc's radius and centre, " +
-              "and arcs are not part of the solver's unknowns yet, so there is nothing here for it to constrain. " +
-              "Constrain the centre line of the arc with distance and angle instead, or leave the arc unconstrained",
+            `tangent(${constraint.line}, ${constraint.arc}) needs an arc with a positive radius, and ` +
+              `"${constraint.arc}" has ${radius}: a point has no tangent to be on`,
           );
         }
-        throw new ConstraintError(`unsupported constraint ${JSON.stringify(never)}`);
+        if (squaredNorm(direction(u0, line)).isZero()) {
+          throw new ConstraintError(
+            `tangent(${constraint.line}, ${constraint.arc}) needs the line to have a direction, ` +
+              `but "${constraint.line}" has zero length`,
+          );
+        }
+        quadratic.push({
+          kind: "tangent",
+          a: line,
+          b: line,
+          arcBase: arc.base,
+          value: Q.from(radius),
+          label: `tangent(${constraint.line}, ${constraint.arc}) = ${radius}`,
+        });
+        break;
+      }
+      default: {
+        throw new ConstraintError(`unsupported constraint ${JSON.stringify(constraint)}`);
       }
     }
   }
@@ -369,6 +448,12 @@ function direction(u: readonly Q[], lineIndex: number): { dx: Q; dy: Q } {
 
 function squaredNorm(vector: { dx: Q; dy: Q }): Q {
   return vector.dx.mul(vector.dx).add(vector.dy.mul(vector.dy));
+}
+
+/** The vector from the constrained line's start to the arc's centre, in exact rationals. */
+function arcOffset(u: readonly Q[], pair: QuadraticPair): { x: Q; y: Q } {
+  const base = pair.arcBase!;
+  return { x: u[base]!.sub(u[pair.a * 4]!), y: u[base + 1]!.sub(u[pair.a * 4 + 1]!) };
 }
 
 /**
@@ -392,6 +477,13 @@ function quadraticValue(pair: QuadraticPair, u: readonly Q[]): Q {
       return dotProduct;
     case "angle":
       return det.mul(pair.cos!).sub(dotProduct.mul(pair.sin!));
+    case "tangent": {
+      const lineDirection = direction(u, pair.a);
+      const offset = arcOffset(u, pair);
+      const det = lineDirection.dx.mul(offset.y).sub(lineDirection.dy.mul(offset.x));
+      const norm = squaredNorm(lineDirection);
+      return det.mul(det).sub(pair.value!.mul(pair.value!).mul(norm));
+    }
     case "keepLength":
     case "distance": {
       const firstPoint = { x: u[coordinate(pair.a, pair.endA!, 0)]!, y: u[coordinate(pair.a, pair.endA!, 1)]! };
@@ -444,6 +536,38 @@ function quadraticRow(pair: QuadraticPair, u: readonly Q[], unknownCount: number
   const row = zeroRow(unknownCount);
   const baseA = pair.a * 4;
   const baseB = pair.b * 4;
+
+  if (pair.kind === "tangent") {
+    /*
+     * `f = det(d, c - p)² - r²|d|²` with `d` the line's direction and `c - p` the offset from its start to the centre.
+     * Writing `D` for the determinant and `n` for `|d|²`:
+     *
+     *   ∂f/∂d = (2D·w_y - 2r²d_x, -2D·w_x - 2r²d_y)      ∂f/∂w = (-2D·d_y, 2D·d_x)
+     *
+     * Both halves matter. The first is the tangency: move the line until its perpendicular distance is `r`. The second is
+     * the -2r²n term, without which the gradient would push the line towards zero length, because a collapsed line is
+     * trivially tangent to everything.
+     */
+    const lineDirection = direction(u, pair.a);
+    const offset = arcOffset(u, pair);
+    const two = new Q(2n, 1n);
+    const det = lineDirection.dx.mul(offset.y).sub(lineDirection.dy.mul(offset.x));
+    const radius = pair.value!;
+    const twiceRadial = two.mul(radius).mul(radius);
+    const detByLine = { dx: two.mul(det).mul(offset.y).sub(twiceRadial.mul(lineDirection.dx)),
+      dy: two.mul(det).mul(offset.x).neg().sub(twiceRadial.mul(lineDirection.dy)) };
+    const detByOffset = { dx: two.mul(det).mul(lineDirection.dy).neg(), dy: two.mul(det).mul(lineDirection.dx) };
+    const start = pair.a * 4;
+    // the start moves opposite to the direction and opposite to the offset, the end only with the direction
+    row[start] = detByLine.dx.add(detByOffset.dx).neg();
+    row[start + 1] = detByLine.dy.add(detByOffset.dy).neg();
+    row[start + 2] = detByLine.dx;
+    row[start + 3] = detByLine.dy;
+    row[pair.arcBase!] = detByOffset.dx;
+    row[pair.arcBase! + 1] = detByOffset.dy;
+    const tangency = dot(row, u);
+    return { coefficients: row, target: tangency.sub(quadraticValue(pair, u)), label: pair.label };
+  }
 
   if (pair.kind === "distance" || pair.kind === "keepLength") {
     const firstPoint = { x: u[coordinate(pair.a, pair.endA!, 0)]!, y: u[coordinate(pair.a, pair.endA!, 1)]! };
@@ -501,6 +625,8 @@ export function solveLines(lines: readonly LineEntity[], constraints: readonly C
 
 export interface SolveReport {
   readonly lines: readonly LineEntity[];
+  /** The arcs, with any centre the solver moved. Absent when the sketch had no arcs. */
+  readonly arcs?: readonly ArcEntity[];
   /** Linear solves performed. One when every constraint was linear; more when angular ones had to be iterated. */
   readonly iterations: number;
   /**
@@ -517,6 +643,8 @@ export interface SolveOptions {
   readonly maxIterations?: number;
   /** Relative angular error accepted as solved. Default 1e-12, which is a million times tighter than a drawing needs. */
   readonly tolerance?: number;
+  /** Arcs the constraints may move. A `tangent` constraint needs its arc here, and the arc's radius is never changed. */
+  readonly arcs?: readonly ArcEntity[];
 }
 
 const DEFAULT_MAX_ITERATIONS = 32;
@@ -547,8 +675,9 @@ export function solveSketch(
   constraints: readonly Constraint[],
   options: SolveOptions = {},
 ): SolveReport {
-  if (lines.length === 0) return { lines: [], iterations: 0, residual: 0, exact: true };
-  const built = buildSystem(lines, constraints);
+  const arcs = options.arcs ?? [];
+  if (lines.length === 0) return { lines: [], arcs: [], iterations: 0, residual: 0, exact: true };
+  const built = buildSystem(lines, constraints, arcs);
   const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
 
@@ -557,7 +686,8 @@ export function solveSketch(
       built.rows.length === 0
         ? lines.map((line) => ({ ...line }))
         : toLines(solveSystem(built.u0, built.rows), lines);
-    return { lines: solved, iterations: built.rows.length === 0 ? 0 : 1, residual: 0, exact: true };
+    const solvedArcs = built.rows.length === 0 ? arcs.map((arc) => ({ ...arc })) : toArcs(built.u0, lines, arcs);
+    return { lines: solved, arcs: solvedArcs, iterations: built.rows.length === 0 ? 0 : 1, residual: 0, exact: true };
   }
 
   for (const pair of built.quadratic) {
@@ -573,12 +703,13 @@ export function solveSketch(
   // The linear rows alone first, so every angular row below is linearised about a configuration that obeys them.
   let current = built.rows.length === 0 ? built.u0 : solveSystem(built.u0, built.rows);
   let iterations = built.rows.length === 0 ? 0 : 1;
-  checkRepresentable(current, lines, built.quadratic);
+  checkRepresentable(current, lines, built.quadratic, arcs);
 
   for (let step = 0; ; step += 1) {
     const report = measure(built.quadratic, current);
     const settled = {
       lines: toLines(current, lines),
+      arcs: toArcs(current, lines, arcs),
       iterations,
       residual: report.residual,
       exact: report.exact,
@@ -586,14 +717,14 @@ export function solveSketch(
     if (report.exact || report.residual <= tolerance) return settled;
     if (step === maxIterations) {
       throw new ConstraintError(
-        `angular constraints did not converge in ${maxIterations} iterations: ` +
+        `quadratic constraints did not converge in ${maxIterations} iterations: ` +
           `${built.quadratic.map((pair) => pair.label).join(", ")} still off by ${report.residual}`,
       );
     }
     const rows = [...built.rows, ...built.quadratic.map((pair) => quadraticRow(pair, current, built.unknownCount))];
     const next = preserveLengths(built, current, solveSystem(current, rows));
     iterations += 1;
-    checkRepresentable(next, lines, built.quadratic);
+    checkRepresentable(next, lines, built.quadratic, arcs);
     const moved = next.some((value, index) => !value.sub(current[index]!).isZero());
     if (!moved) {
       throw new ConstraintError(
@@ -605,16 +736,50 @@ export function solveSketch(
   }
 }
 
-/** The lines an angular constraint acts on and no `distance` constraint has already pinned. */
+/**
+ * The lines the length gauge may touch: those a quadratic constraint acts on, that no `distance` constraint already pins,
+ * and whose endpoints the caller has not pinned down with `fixed` or `coincident`.
+ *
+ * That last exclusion is a bug fix, not tidiness. The gauge works by moving one end up and the other down by the same
+ * amount, which is invisible when the line is free and a violation of the caller's constraint when it is not: measured on
+ * `tangent(wall, c)` with the wall pinned at both ends, the solve moved the arc correctly and then shifted the wall's
+ * endpoints by ±0.0104 to restore its length, putting a pinned point off its pin. A pin outranks a gauge, so the gauge
+ * skips the line; a line that could collapse without it is still caught by `checkRepresentable` rather than returned.
+ */
 function gaugeTargets(built: BuiltSystem): number[] {
+  const pinned = pinnedCoordinates(built.rows);
   const targets = new Set<number>();
   for (const pair of built.quadratic) {
     if (pair.kind === "distance" || pair.kind === "keepLength") continue;
     for (const index of [pair.a, pair.b]) {
-      if (!built.lengthPinned.has(index)) targets.add(index);
+      if (built.lengthPinned.has(index)) continue;
+      if (isPinnedLine(pinned, index)) continue;
+      targets.add(index);
     }
   }
   return [...targets];
+}
+
+/** Unknown indexes a linear row fixes outright: one coefficient of one, and a target. */
+function pinnedCoordinates(rows: readonly Row[]): Set<number> {
+  const pinned = new Set<number>();
+  for (const row of rows) {
+    const nonZero = row.coefficients.reduce<number[]>((indexes, coefficient, index) => {
+      if (!coefficient.isZero()) indexes.push(index);
+      return indexes;
+    }, []);
+    const only = nonZero[0];
+    if (nonZero.length !== 1 || only === undefined) continue;
+    // a row whose single coefficient is one is a pin on that coordinate; anything else is a relation between unknowns
+    if (!row.coefficients[only]!.sub(ONE).isZero()) continue;
+    pinned.add(only);
+  }
+  return pinned;
+}
+
+function isPinnedLine(pinned: Set<number>, lineIndex: number): boolean {
+  const base = lineIndex * 4;
+  return pinned.has(base) || pinned.has(base + 1) || pinned.has(base + 2) || pinned.has(base + 3);
 }
 
 /**
@@ -689,6 +854,7 @@ function checkRepresentable(
   u: readonly Q[],
   lines: readonly LineEntity[],
   quadratic: readonly QuadraticPair[],
+  arcs: readonly ArcEntity[] = [],
 ): void {
   for (let index = 0; index < lines.length; index += 1) {
     const base = index * 4;
@@ -718,6 +884,25 @@ function checkRepresentable(
       );
     }
   }
+
+  for (let index = 0; index < arcs.length; index += 1) {
+    const base = lines.length * 4 + index * 2;
+    const centre = [u[base]!, u[base + 1]!];
+    if (!centre.every((value) => Number.isFinite(value.toNumber()))) {
+      throw new ConstraintError(
+        `arc "${arcs[index]!.id}" left the range a sketch can hold: the constraints drive its centre past the largest ` +
+          "number a double can represent, which means they cannot all be satisfied",
+      );
+    }
+    const widest = centre.reduce((most, value) => Math.max(most, Math.abs(value.toNumber())), 0);
+    if (widest > MAX_COORDINATE) {
+      throw new ConstraintError(
+        `arc "${arcs[index]!.id}" left the range a sketch can hold while satisfying ` +
+          `${quadratic.map((pair) => pair.label).join(", ")}: its centre grew past ${MAX_COORDINATE}, which no drawing ` +
+          "reaches, so those constraints cannot all be satisfied",
+      );
+    }
+  }
 }
 
 /**
@@ -744,6 +929,20 @@ function measure(quadratic: readonly QuadraticPair[], u: readonly Q[]): { exact:
     }
     if (quadraticValue(pair, u).isZero()) continue;
     exact = false;
+
+    if (pair.kind === "tangent") {
+      // the error is reported as a fraction of the radius: |distance from the centre to the line - r| / r
+      const lineDirection = direction(u, pair.a);
+      const offset = arcOffset(u, pair);
+      const det =
+        lineDirection.dx.toNumber() * offset.y.toNumber() - lineDirection.dy.toNumber() * offset.x.toNumber();
+      const norm = Math.hypot(lineDirection.dx.toNumber(), lineDirection.dy.toNumber());
+      const radius = pair.value!.toNumber();
+      if (norm === 0 || radius === 0) return { exact: false, residual: Number.POSITIVE_INFINITY };
+      const error = Math.abs(Math.abs(det) / norm - radius) / radius;
+      if (error > worst) worst = error;
+      continue;
+    }
 
     if (pair.kind === "distance") {
       const dx = u[coordinate(pair.a, pair.endA!, 0)]!.toNumber() - u[coordinate(pair.b, pair.endB!, 0)]!.toNumber();
@@ -795,6 +994,23 @@ function solveSystem(u0: readonly Q[], rows: readonly Row[]): Q[] {
     }
   }
   return updated;
+}
+
+/**
+ * The arcs, with their centres read back out of the solved vector.
+ *
+ * The radius and the sweep are copied through untouched: the solver has no unknown for either, so reading them back from
+ * anywhere but the input would be inventing a change that did not happen.
+ */
+function toArcs(u: readonly Q[], lines: readonly LineEntity[], arcs: readonly ArcEntity[]): ArcEntity[] {
+  return arcs.map((arc, index) => {
+    const base = lines.length * 4 + index * 2;
+    const centre = { x: u[base]!.toNumber(), y: u[base + 1]!.toNumber() };
+    if (!Number.isFinite(centre.x) || !Number.isFinite(centre.y)) {
+      throw new ConstraintError(`arc "${arc.id}" left the range a sketch can hold: its centre is not a finite number`);
+    }
+    return { ...arc, centre };
+  });
 }
 
 function toLines(u: readonly Q[], lines: readonly LineEntity[]): LineEntity[] {

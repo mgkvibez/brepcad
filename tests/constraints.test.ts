@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ConstraintError, solveLines, solveSketch, type Constraint, type LineEntity } from "../src/constraints.js";
+import { lineArcIntersections } from "../src/sketch.js";
 
 const line = (id: string, x1: number, y1: number, x2: number, y2: number): LineEntity => ({
   kind: "line",
@@ -350,10 +351,130 @@ describe("distance and angle", () => {
     );
   });
 
-  it("refuses tangent by name and says what it would need", () => {
+  it("refuses a tangent that names a line where an arc belongs", () => {
     const lines = [line("a", 0, 0, 3, 4), line("b", 1, 0, 4, 5)];
-    expect(() => solveSketch(lines, [{ kind: "tangent", lineA: "a", lineB: "b" }])).toThrow(/tangent is refused by name/);
-    expect(() => solveSketch(lines, [{ kind: "tangent", lineA: "a", lineB: "b" }])).toThrow(/arc's radius/);
+    expect(() => solveSketch(lines, [{ kind: "tangent", line: "a", arc: "b" }])).toThrow(/unknown arc "b"/);
+  });
+
+  it("refuses a tangent to an arc with no radius, because a point has no tangent", () => {
+    const lines = [line("a", -10, 0, 10, 0)];
+    const arcs = [{ kind: "arc" as const, id: "c", centre: { x: 0, y: 8 }, radius: 0 }];
+    expect(() => solveSketch(lines, [{ kind: "tangent", line: "a", arc: "c" }], { arcs })).toThrow(
+      /positive radius/,
+    );
+  });
+
+  it("refuses a tangent when the line has no direction to be tangent along", () => {
+    const lines = [line("a", 4, 4, 4, 4)];
+    const arcs = [{ kind: "arc" as const, id: "c", centre: { x: 0, y: 0 }, radius: 2 }];
+    expect(() => solveSketch(lines, [{ kind: "tangent", line: "a", arc: "c" }], { arcs })).toThrow(/zero length/);
+  });
+
+  it("moves the arc's centre until the line is its tangent, and leaves the radius alone", () => {
+    // the line is pinned along y = 0, so the radius-5 arc at (3, 12) is the thing that has to move: down to y = 5
+    const lines = [line("wall", -20, 0, 20, 0)];
+    const constraints: Constraint[] = [
+      { kind: "fixed", line: "wall", at: "start", x: -20, y: 0 },
+      { kind: "fixed", line: "wall", at: "end", x: 20, y: 0 },
+      { kind: "tangent", line: "wall", arc: "c" },
+    ];
+    const arcs = [{ kind: "arc" as const, id: "c", centre: { x: 3, y: 12 }, radius: 5 }];
+    const report = solveSketch(lines, constraints, { arcs });
+    const solved = report.arcs![0]!;
+    expect(solved.id).toBe("c");
+    expect(solved.radius).toBe(5);
+    expect(solved.centre.x).toBeCloseTo(3, 10);
+    expect(solved.centre.y).toBeCloseTo(5, 10);
+    expect(report.residual).toBeLessThanOrEqual(1e-12);
+    // the pin is not in dispute: tangency may not buy itself a moved endpoint
+    expect(report.lines[0]!.start).toEqual({ x: -20, y: 0 });
+    expect(report.lines[0]!.end).toEqual({ x: 20, y: 0 });
+    // and the tangency, measured independently of the solver's own arithmetic: the perpendicular distance is the radius
+    const wall = report.lines[0]!;
+    const dx = wall.end.x - wall.start.x;
+    const dy = wall.end.y - wall.start.y;
+    const offsetX = solved.centre.x - wall.start.x;
+    const offsetY = solved.centre.y - wall.start.y;
+    expect(Math.abs(dx * offsetY - dy * offsetX) / Math.hypot(dx, dy)).toBeCloseTo(5, 10);
+  });
+
+  it("leaves the line touching the arc at one point, checked by closed-form intersections rather than by the solver", () => {
+    // sketch.ts solves line/arc intersections in closed form, with no code in common with the solver. A tangent line meets
+    // the circle at a double root, and a double root splits into two roots about 1e-7 apart in doubles when the line is
+    // off by 1e-14, so "one point" is checked as "the two roots coincide", not as "the solver said so"
+    const lines = [line("wall", -20, 3, 20, 3)];
+    const constraints: Constraint[] = [
+      { kind: "horizontal", line: "wall" },
+      { kind: "fixedArc", arc: "c", x: 0, y: 0 },
+      { kind: "tangent", line: "wall", arc: "c" },
+    ];
+    const arcs = [{ kind: "arc" as const, id: "c", centre: { x: 0, y: 0 }, radius: 7, start: 0, end: Math.PI * 2 }];
+    const report = solveSketch(lines, constraints, { arcs });
+    const wall = report.lines[0]!;
+    const circle = report.arcs![0]!;
+    const crossings = lineArcIntersections(
+      { kind: "line", a: wall.start, b: wall.end },
+      { kind: "arc", centre: circle.centre, radius: circle.radius, start: circle.start!, end: circle.end! },
+    );
+    expect(crossings.length).toBeGreaterThan(0);
+    expect(crossings.length).toBeLessThanOrEqual(2);
+    const spread = Math.hypot(crossings[0]!.x - crossings.at(-1)!.x, crossings[0]!.y - crossings.at(-1)!.y);
+    expect(spread).toBeLessThan(1e-5);
+    for (const crossing of crossings) {
+      expect(Math.hypot(crossing.x, crossing.y)).toBeCloseTo(7, 7);
+    }
+  });
+
+  it("holds two arcs tangent to the same line at once", () => {
+    const lines = [line("rail", -50, 0, 50, 0)];
+    const constraints: Constraint[] = [
+      { kind: "fixed", line: "rail", at: "start", x: -50, y: 0 },
+      { kind: "fixed", line: "rail", at: "end", x: 50, y: 0 },
+      { kind: "tangent", line: "rail", arc: "small" },
+      { kind: "tangent", line: "rail", arc: "large" },
+    ];
+    const arcs = [
+      { kind: "arc" as const, id: "small", centre: { x: -20, y: 9 }, radius: 2, start: 0, end: Math.PI * 2 },
+      { kind: "arc" as const, id: "large", centre: { x: 20, y: -14 }, radius: 6, start: 0, end: Math.PI * 2 },
+    ];
+    const report = solveSketch(lines, constraints, { arcs });
+    const [small, large] = report.arcs!;
+    expect(small!.centre.y).toBeCloseTo(2, 9);
+    expect(large!.centre.y).toBeCloseTo(-6, 9);
+    expect(report.residual).toBeLessThanOrEqual(1e-12);
+  });
+
+  it("reports a sketch that is already tangent as exact and does not move it", () => {
+    const lines = [
+      line("wall", -20, 0, 20, 0),
+    ];
+    const constraints: Constraint[] = [
+      { kind: "fixed", line: "wall", at: "start", x: -20, y: 0 },
+      { kind: "fixed", line: "wall", at: "end", x: 20, y: 0 },
+    ];
+    const arcs = [{ kind: "arc" as const, id: "c", centre: { x: 3, y: -5 }, radius: 5 }];
+    const report = solveSketch(lines, [...constraints, { kind: "tangent", line: "wall", arc: "c" }], { arcs });
+    expect(report.exact).toBe(true);
+    expect(report.residual).toBe(0);
+    expect(report.arcs![0]!.centre).toEqual({ x: 3, y: -5 });
+  });
+
+  it("moves the line when the arc is pinned instead, and keeps its ends level", () => {
+    // the same sketch with the two roles swapped: fixedArc holds the centre, and the line slides to y = 5
+    const lines = [line("wall", -20, 10, 20, 10)];
+    const constraints: Constraint[] = [
+      { kind: "horizontal", line: "wall" },
+      { kind: "fixedArc", arc: "c", x: 0, y: 15 },
+      { kind: "tangent", line: "wall", arc: "c" },
+    ];
+    const arcs = [{ kind: "arc" as const, id: "c", centre: { x: 0, y: 15 }, radius: 10 }];
+    const report = solveSketch(lines, constraints, { arcs });
+    const [wall] = report.lines;
+    expect(wall!.start.y).toBeCloseTo(5, 10);
+    expect(wall!.end.y).toBeCloseTo(5, 10);
+    expect(report.arcs![0]!.centre).toEqual({ x: 0, y: 15 });
+    // the line slid rather than growing: its length is the one it was drawn with
+    expect(Math.abs(wall!.end.x - wall!.start.x)).toBeCloseTo(40, 10);
   });
 
   it("keeps distance and angle out of solveLines, which only claims the linear ones", () => {
